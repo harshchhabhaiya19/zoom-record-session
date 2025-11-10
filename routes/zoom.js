@@ -89,55 +89,98 @@ router.get('/sessions/:batchId', async (req, res) => {
 /* webhook: recording.completed */
 router.post('/webhook', async (req, res) => {
   try {
-    if (!verifyZoomWebhook(req)) return res.status(401).send('unauthorized');
     const event = req.body.event;
-    if (event !== 'recording.completed') return res.status(200).send('ignored');
 
-    const payloadObj = req.body.payload?.object;
-    const meetingId = payloadObj?.id || payloadObj?.meeting_id;
-    const meetingUUID = payloadObj?.uuid;
+    // 1️⃣ Handle URL Validation Challenge from Zoom
+    if (event === 'endpoint.url_validation') {
+      const plainToken = req.body.payload.plainToken;
+      const secretToken = process.env.ZOOM_WEBHOOK_VERIFICATION_TOKEN; // from .env
 
-    console.log('recording.completed for meeting', meetingId, meetingUUID);
+      const encryptedToken = crypto
+        .createHmac('sha256', secretToken)
+        .update(plainToken)
+        .digest('hex');
 
-    // find session by zoomMeetingId
-    const session = await Session.findOne({ zoomMeetingId: String(meetingId) });
-    if (!session) {
-      console.warn('no session match for meeting', meetingId);
-      return res.status(200).send('no session');
-    }
-
-    // fetch recording files
-    const token = await getS2SToken();
-    const recordingsResp = await axios.get(`https://api.zoom.us/v2/meetings/${encodeURIComponent(meetingUUID)}/recordings`, { headers: { Authorization: `Bearer ${token}` } });
-    const files = recordingsResp.data.recording_files || [];
-    for (const file of files) {
-      if (!file.download_url) continue;
-      // only mp4
-      if (file.file_type && file.file_type.toUpperCase() !== 'MP4') continue;
-
-      // download as arraybuffer (for upload)
-      const downloadResp = await axios.get(file.download_url, { responseType: 'arraybuffer', headers: { Authorization: `Bearer ${token}` } });
-
-      const key = `zoom-recordings/${session._id}/${file.id || Date.now()}.mp4`;
-      const s3Url = await uploadToS3({ key, body: Buffer.from(downloadResp.data), contentType: 'video/mp4' });
-
-      await Recording.create({
-        sessionId: session._id,
-        zoomRecordingId: file.id,
-        fileType: file.file_type,
-        fileSize: file.file_size,
-        duration: file.duration,
-        s3Key: key,
-        s3Url,
-        recordedAt: file.recording_start
+      console.log('✅ Zoom webhook URL validation success');
+      return res.status(200).json({
+        plainToken,
+        encryptedToken,
       });
-
-      console.log('uploaded recording to s3:', s3Url);
     }
 
-    res.status(200).send('ok');
+    // 2️⃣ Verify Secret Token in every event request
+    const authHeader = req.headers.authorization;
+    const expectedToken = `Bearer ${process.env.ZOOM_WEBHOOK_SECRET_TOKEN}`;
+    if (!authHeader || authHeader !== expectedToken) {
+      console.warn('❌ Invalid webhook secret token');
+      return res.status(401).send('Unauthorized - Invalid secret');
+    }
+
+    // 3️⃣ Handle recording.completed events
+    if (event === 'recording.completed') {
+      const payloadObj = req.body.payload?.object;
+      const meetingId = payloadObj?.id || payloadObj?.meeting_id;
+      const meetingUUID = payloadObj?.uuid;
+
+      console.log('🎥 recording.completed for meeting:', meetingId, meetingUUID);
+
+      // find session by meeting ID
+      const session = await Session.findOne({ zoomMeetingId: String(meetingId) });
+      if (!session) {
+        console.warn('⚠️ No session match for meeting', meetingId);
+        return res.status(200).send('no session');
+      }
+
+      // get recording files
+      const token = await getS2SToken();
+      const recordingsResp = await axios.get(
+        `https://api.zoom.us/v2/meetings/${encodeURIComponent(meetingUUID)}/recordings`,
+        { headers: { Authorization: `Bearer ${token}` } }
+      );
+
+      const files = recordingsResp.data.recording_files || [];
+      console.log(`Found ${files.length} recording files for meeting ${meetingId}`);
+
+      for (const file of files) {
+        if (!file.download_url) continue;
+        if (file.file_type && file.file_type.toUpperCase() !== 'MP4') continue;
+
+        // download
+        const downloadResp = await axios.get(file.download_url, {
+          responseType: 'arraybuffer',
+          headers: { Authorization: `Bearer ${token}` },
+        });
+
+        // upload to S3
+        const key = `zoom-recordings/${session._id}/${file.id || Date.now()}.mp4`;
+        const s3Url = await uploadToS3({
+          key,
+          body: Buffer.from(downloadResp.data),
+          contentType: 'video/mp4',
+        });
+
+        // save to DB
+        await Recording.create({
+          sessionId: session._id,
+          zoomRecordingId: file.id,
+          fileType: file.file_type,
+          fileSize: file.file_size,
+          duration: file.duration,
+          s3Key: key,
+          s3Url,
+          recordedAt: file.recording_start,
+        });
+
+        console.log(`✅ Uploaded recording for meeting ${meetingId} → ${s3Url}`);
+      }
+
+      return res.status(200).send('ok');
+    }
+
+    // 4️⃣ Ignore other events
+    res.status(200).send('ignored');
   } catch (err) {
-    console.error('webhook error', err.response?.data || err.message || err);
+    console.error('❌ Webhook error', err.response?.data || err.message || err);
     res.status(500).send('server error');
   }
 });
